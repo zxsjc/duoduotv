@@ -1,0 +1,1 @@
+System.register([],function(_export,_context){"use strict";var e,t,n,r,i,a,o,s,c;return{setters:[],execute:function(){_export("n",e={cellSize:128,gap:8}),_export("s",t=.46),_export("i",n=.12),_export("a",r=.95),_export("o",i=.5),_export("r",a=[.45,0,.2,1]),_export("l",o=e=>e<640?.52:e<1100?.64:.76),_export("c",s=.36),_export("t",c=.42);}};});

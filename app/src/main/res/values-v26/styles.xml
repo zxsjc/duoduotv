@@ -1,0 +1,22 @@
+<resources>
+    <!-- API 26+ 全局关闭系统默认焦点高亮框，保留各控件自定义焦点样式。
+         放置于 values-v26：android:defaultFocusHighlightEnabled 为 API 26+ 属性。 -->
+    <style name="AppTheme" parent="android:style/Theme.Holo.NoActionBar.Fullscreen">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowBackground">@color/player_background</item>
+        <item name="android:defaultFocusHighlightEnabled">false</item>
+    </style>
+    <style name="ManagementTheme" parent="android:style/Theme.Holo.NoActionBar">
+        <!-- Keep MainActivity's decoder Surface alive behind the opaque WebView. -->
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+        <item name="android:windowAnimationStyle">@null</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowDisablePreview">true</item>
+        <item name="android:colorBackgroundCacheHint">@android:color/transparent</item>
+        <item name="android:defaultFocusHighlightEnabled">false</item>
+    </style>
+</resources>

@@ -1,0 +1,461 @@
+package xiao.bu.tv;
+
+import android.content.Context;
+import android.graphics.SurfaceTexture;
+import android.media.MediaFormat;
+import android.media.MediaCodec;
+import android.media.MediaCrypto;
+import java.util.LinkedHashMap;
+import android.opengl.EGL14;
+import android.opengl.EGLConfig;
+import android.opengl.EGLContext;
+import android.opengl.EGLDisplay;
+import android.opengl.EGLSurface;
+import android.opengl.GLES11Ext;
+import android.opengl.GLES20;
+import android.os.Build;
+import android.os.Handler;
+import android.os.HandlerThread;
+import android.os.Looper;
+import android.os.SystemClock;
+import android.util.Log;
+import android.view.Surface;
+import android.view.Display;
+import android.view.View;
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+import java.nio.FloatBuffer;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+
+/** API 17+ GPU tone mapping/BT.709 bridge. Hardware decoding and SurfaceView remain. */
+public final class NativeHdrOutput implements SurfaceTexture.OnFrameAvailableListener {
+    private static final String TAG = "nTvHdr";
+    private static volatile Context context;
+    private static volatile Display targetDisplay;
+    private static volatile NativeHdrOutput active;
+    private static volatile String outputRoute = "";
+    private static final LinkedHashMap<String,Boolean> rejectedMapping = new LinkedHashMap<>();
+    private final CountDownLatch stopped = new CountDownLatch(1);
+    private final HandlerThread thread = new HandlerThread("nTv HDR output");
+    private Handler handler;
+    private final Surface target;
+    private final int width, height, transfer;
+    private final int configuredStandard, configuredRange, sourceDepth;
+    private boolean rawYuv;
+    private int yuvMatrix, yuvOffset;
+    private final boolean forceBt709;
+    private final float peak;
+    private volatile boolean closed;
+    private volatile Throwable failure;
+    private Surface input;
+    private SurfaceTexture texture;
+    private EGLDisplay display = EGL14.EGL_NO_DISPLAY;
+    private EGLContext eglContext = EGL14.EGL_NO_CONTEXT;
+    private EGLSurface window = EGL14.EGL_NO_SURFACE;
+    private int program, textureId, position, texcoord, transform;
+    private int renderWidth, renderHeight;
+    private final float[] matrix = new float[16];
+    private final int[] windowSize = new int[1];
+    private final FloatBuffer vertices = ByteBuffer.allocateDirect(16 * 4)
+            .order(ByteOrder.nativeOrder()).asFloatBuffer();
+    private long lastTextureTimestamp, rateStart, rateFrames;
+    private volatile long renderedFrames, lastRenderedAt;
+    private volatile float renderedRate;
+    private volatile String decoderColor = "";
+
+    static void initialize(Context value, View output) {
+        context = value.getApplicationContext();
+        // Bind the display that owns this SurfaceView, including external displays.
+        // Called on the UI thread; native configure can query the saved Display later.
+        targetDisplay = output == null ? null : output.getDisplay();
+    }
+
+    private static int[] supportedHdrTypes() {
+        if (Build.VERSION.SDK_INT < 24) return null;
+        Display display = targetDisplay;
+        if (display == null) return null;
+        try {
+            if (!display.isValid()) return null;
+            return DisplayApi24.supportedHdrTypes(display);
+        } catch (RuntimeException error) {
+            Log.w(TAG, "HDR display capability query failed; use SDR mapping", error);
+            return null;
+        }
+    }
+
+    private static final class DisplayApi24 {
+        static int[] supportedHdrTypes(Display display) {
+            return display.getHdrCapabilities().getSupportedHdrTypes();
+        }
+    }
+
+    /** Called by IJK before configure; null means native HDR/normal SDR output. */
+    public static synchronized NativeHdrOutput create(MediaFormat format, Surface surface) {
+        NativeHdrOutput previous = active;
+        if (previous != null && previous.target == surface) {
+            previous.release();
+            try {
+                if (!previous.stopped.await(1500,TimeUnit.MILLISECONDS))
+                    throw new IllegalStateException("Previous HDR output has not released the Surface");
+            } catch (InterruptedException error) {
+                Thread.currentThread().interrupt(); throw new IllegalStateException(error);
+            }
+        }
+        int transfer = integer(format, "color-transfer", 0);
+        int mode = integer(format, "ntv-hdr-mode", HdrMode.nativeValue(HdrMode.DEFAULT));
+        if(mode==3||mode==2||integer(format,"ntv-force-gpu",0)!=0)format.setInteger("color-transfer-request",0);
+        int sourceTransfer = integer(format,"ntv-source-transfer",transfer);
+        int sourceStandard = integer(format,"ntv-source-standard",1);
+        boolean forceBt709 = mode == 2 && (sourceTransfer == 6 || sourceTransfer == 7
+                || sourceStandard != 0 && sourceStandard != 1);
+        boolean wideGamut = !forceBt709 && sourceStandard == 6 && transfer != 6 && transfer != 7;
+        outputRoute = "SDR直出";
+        if ((!forceBt709 && !wideGamut && transfer != 6 && transfer != 7) || surface == null) return null;
+        int[] hdrTypes = supportedHdrTypes();
+        if (HdrDisplayPolicy.passthrough(mode, transfer, hdrTypes, Build.VERSION.SDK_INT)) {
+            outputRoute = "HDR直出";
+            Log.i(TAG, "HDR hardware passthrough transfer=" + transfer);
+            return null;
+        }
+        if (mode == 1 && !wideGamut) Log.i(TAG, "HDR display fallback: transfer=" + transfer
+                + " hdrTypes=" + java.util.Arrays.toString(hdrTypes)
+                + " sdk=" + Build.VERSION.SDK_INT + " -> SDR mapping");
+        Context ctx = context;
+        if (ctx == null) throw new IllegalStateException("HDR output context is unavailable");
+        // Do not silently tag PQ/HLG as SDR. New codecs may perform real tone mapping.
+        if (!forceBt709 && !wideGamut
+                && integer(format,"ntv-force-gpu",0)==0
+                && HdrDisplayPolicy.decoderToneMapping(mode, Build.VERSION.SDK_INT)) {
+            format.setInteger("color-transfer-request", 3);
+            outputRoute = "解码器→SDR";
+            Log.i(TAG, "Request decoder HDR -> SDR transfer=" + transfer);
+            return null;
+        }
+        float peak = peak(format,1000f);
+        // Missing transfer is not proof of HDR. Convert wide-gamut SDR using the
+        // SDR display curve, without changing the source metadata in the HUD.
+        int renderTransfer = forceBt709 ? 0 : wideGamut ? (transfer == 1 ? 1 : 3) : transfer;
+        NativeHdrOutput bridge = new NativeHdrOutput(surface, integer(format, "width", 0),
+                integer(format, "height", 0), renderTransfer, peak, forceBt709,
+                integer(format, "color-standard", sourceStandard),integer(format,"color-range",2),
+                integer(format,"ntv-source-depth","video/hevc".equals(format.getString("mime"))
+                        && integer(format,"profile",0)==2?10:8));
+        if (wideGamut) Log.i(TAG, "BT.2020 -> BT.709 gamut conversion; source transfer=" + sourceTransfer);
+        Log.i(TAG, "GPU HDR output mode=" + mode + " transfer=" + transfer
+                + " display=" + (targetDisplay == null ? "unknown" : targetDisplay.getDisplayId()));
+        active = bridge;
+        outputRoute = forceBt709 ? "GPU BT.709" : "GPU→SDR";
+        return bridge;
+    }
+
+    /** Configure once, or retry the same hardware codec with GPU mapping if its SDR request is rejected. */
+    public static NativeHdrOutput configure(MediaCodec codec,MediaFormat format,Surface surface,MediaCrypto crypto,int flags) {
+        String key=null;
+        if(Build.VERSION.SDK_INT>=31){
+            key=codec.getName()+":"+format.getString("mime")+":"+integer(format,"color-standard",0)+":"+integer(format,"color-range",0)
+                    +":"+integer(format,"ntv-source-transfer",integer(format,"color-transfer",0))
+                    +":"+integer(format,"profile",0)+":"+integer(format,"width",0)+"x"+integer(format,"height",0);
+            synchronized(rejectedMapping){if(rejectedMapping.containsKey(key))format.setInteger("ntv-force-gpu",1);}
+        }
+        NativeHdrOutput bridge=create(format,surface);
+        boolean requested=integer(format,"color-transfer-request",0)==3;
+        try{
+            codec.configure(format,bridge==null?surface:bridge.getSurface(),crypto,flags);
+            verifyToneMapping(codec,format);
+            return bridge;
+        }catch(RuntimeException original){
+            if(bridge!=null)bridge.release();
+            if(!requested||bridge!=null||Build.VERSION.SDK_INT<31)throw original;
+            // Do not turn a missing colour-conversion capability into a software decoder fallback.
+            synchronized(rejectedMapping){
+                if(rejectedMapping.size()>=32)rejectedMapping.remove(rejectedMapping.keySet().iterator().next());
+                rejectedMapping.put(key,Boolean.TRUE);
+            }
+            Log.w(TAG,"Codec SDR mapping rejected; retry hardware with GPU output",original);
+            format.setInteger("color-transfer-request",0);format.setInteger("ntv-force-gpu",1);
+            try{
+                codec.reset();
+                bridge=create(format,surface);
+                if(bridge==null)throw new IllegalStateException("HDR GPU fallback unavailable");
+                codec.configure(format,bridge.getSurface(),crypto,flags);
+                return bridge;
+            }catch(RuntimeException fallback){if(bridge!=null)bridge.release();fallback.addSuppressed(original);throw fallback;}
+        }
+    }
+
+    private static float peak(MediaFormat format, float fallback) {
+        float peak = fallback;
+        try {
+            ByteBuffer info = format.getByteBuffer("hdr-static-info");
+            if (info != null && info.remaining() >= 25) {
+                ByteBuffer copy = info.duplicate().order(ByteOrder.LITTLE_ENDIAN);
+                int start = copy.position();
+                int mastering = copy.getShort(start + 17) & 0xffff;
+                int content = copy.getShort(start + 21) & 0xffff;
+                if (content > 0) peak = content;
+                else if (mastering > 0) peak = mastering;
+            }
+        } catch (RuntimeException ignored) { }
+        return Math.max(100f, Math.min(10000f, peak));
+    }
+
+    private static int integer(MediaFormat format, String key, int fallback) {
+        try { return format.containsKey(key) ? format.getInteger(key) : fallback; }
+        catch (RuntimeException ignored) { return fallback; }
+    }
+
+    private NativeHdrOutput(Surface surface, int w, int h, int trc, float max, boolean bt709, int standard, int range, int depth) {
+        target = surface; width = w; height = h; transfer = trc; peak = max;
+        configuredStandard = standard;configuredRange=range;sourceDepth=depth;
+        forceBt709 = bt709;
+        vertices.put(new float[]{-1,-1, 0,0, 1,-1, 1,0, -1,1, 0,1, 1,1, 1,1}).position(0);
+        thread.start(); handler = new Handler(thread.getLooper());
+        CountDownLatch ready = new CountDownLatch(1);
+        handler.post(() -> {
+            try { if (!closed) initializeGl(); }
+            catch (Throwable error) { failure = error; destroyGl(); }
+            finally { ready.countDown(); if (closed) destroyGl(); }
+        });
+        boolean completed = false;
+        try { completed = ready.await(2500, TimeUnit.MILLISECONDS); }
+        catch (InterruptedException error) { Thread.currentThread().interrupt(); }
+        if (!completed || failure != null || input == null) {
+            release();
+            throw new IllegalStateException("HDR GPU output initialization failed", failure);
+        }
+        Log.i(TAG, (forceBt709 ? "GPU BT.709 override " : transfer < 6 ? "GPU BT.2020 -> BT.709 " : "GPU HDR -> SDR ")
+                + width + "x" + height + " transfer=" + transfer + " peak=" + peak
+                + " sampling=" + (rawYuv ? "raw YUV" : "RGB compatibility"));
+    }
+
+    public Surface getSurface() { return input; }
+
+    public static void prepareSoftwareOutput() {
+        NativeHdrOutput previous=active;
+        if (previous == null) return;
+        previous.release();
+        try {
+            if (!previous.stopped.await(1500,TimeUnit.MILLISECONDS))
+                throw new IllegalStateException("HDR output is still connected");
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt(); throw new IllegalStateException(error);
+        }
+    }
+
+    public static void verifyToneMapping(MediaCodec codec, MediaFormat format) {
+        if (Build.VERSION.SDK_INT >= 31 && integer(format,"color-transfer-request",0) == 3) {
+            int accepted = integer(codec.getInputFormat(),"color-transfer-request",0);
+            if (accepted != 3) throw new IllegalStateException("Decoder does not support HDR -> SDR tone mapping");
+        }
+    }
+
+    public void outputFormat(MediaFormat format) {
+        Log.i(TAG,"HDR decoder output " + format);
+        int reportedTransfer = integer(format,"color-transfer",0);
+        int reportedStandard = integer(format,"color-standard",0);
+        int outputStandard = knownStandard(reportedStandard) ? reportedStandard : configuredStandard;
+        boolean knownTransfer = reportedTransfer == 1 || reportedTransfer == 3
+                || reportedTransfer == 6 || reportedTransfer == 7;
+        boolean incompleteSdr = (transfer == 6 || transfer == 7)
+                && (reportedTransfer == 1 || reportedTransfer == 3) && !knownStandard(reportedStandard);
+        // Missing/unspecified output tags do not demonstrate HDR -> SDR conversion.
+        // Keep the validated source transfer until the codec reports a complete
+        // SDR colour description. Otherwise a legacy partial SDR tag bypasses
+        // the HLG/PQ shader while its pixels are still HDR.
+        final int outputTransfer = !knownTransfer || incompleteSdr ? transfer : reportedTransfer;
+        decoderColor = "standard=" + integer(format,"color-standard",0)
+                + " transfer=" + integer(format,"color-transfer",0)
+                + " range=" + integer(format,"color-range",0);
+        if (incompleteSdr) {
+            decoderColor += " (source fallback=" + configuredStandard + "/" + transfer + ")";
+            Log.w(TAG,"Incomplete SDR output tags; keep source HDR transfer=" + transfer
+                    + " standard=" + configuredStandard);
+        }
+        float outputPeak = peak(format,peak);
+        if (!closed) handler.post(() -> {
+            if (closed || program == 0) return;
+            GLES20.glUseProgram(program);
+            updateYuvColor(forceBt709?1:outputStandard,integer(format,"color-range",configuredRange));
+            if (forceBt709) {
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvBt709Source"),rawYuv?1:outputStandard);
+                return;
+            }
+            GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvPeak"),outputPeak);
+            if (outputTransfer == 6 || outputTransfer == 7) {
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvTransfer"),outputTransfer);
+            } else if (outputTransfer == 3 || outputTransfer == 1) {
+                GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvTransfer"),
+                        outputStandard == 6 ? outputTransfer : 0f);
+                Log.i(TAG,"Decoder SDR output; gamut conversion=" + (outputStandard == 6));
+            }
+        });
+    }
+
+    private static boolean knownStandard(int value) {
+        return value == 1 || value == 2 || value == 4 || value == 6;
+    }
+
+    static float renderedFrameRate() {
+        NativeHdrOutput output = active;
+        if (output == null || output.closed) return Float.NaN;
+        return SystemClock.elapsedRealtime()-output.lastRenderedAt > 1000 ? 0f : output.renderedRate;
+    }
+
+    static String outputRoute(boolean hardware) {
+        return hardware ? outputRoute : "软解→SDR";
+    }
+
+    static String decoderColor() {
+        NativeHdrOutput output = active;
+        return output == null || output.closed ? "" : output.decoderColor;
+    }
+
+    public static long renderedFrameCount() {
+        NativeHdrOutput output=active;return output==null ? 0 : output.renderedFrames;
+    }
+
+    private void initializeGl() throws Exception {
+        display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY);
+        int[] version = new int[2];
+        if (!EGL14.eglInitialize(display, version, 0, version, 1)) throw new IllegalStateException("eglInitialize");
+        EGLConfig[] configs = new EGLConfig[1]; int[] count = new int[1];
+        int[] attrs = {EGL14.EGL_RED_SIZE,8,EGL14.EGL_GREEN_SIZE,8,EGL14.EGL_BLUE_SIZE,8,
+                EGL14.EGL_RENDERABLE_TYPE,EGL14.EGL_OPENGL_ES2_BIT,
+                EGL14.EGL_SURFACE_TYPE,EGL14.EGL_WINDOW_BIT,EGL14.EGL_NONE};
+        if (!EGL14.eglChooseConfig(display, attrs, 0, configs, 0, 1, count, 0) || count[0] == 0)
+            throw new IllegalStateException("eglChooseConfig");
+        if(Build.VERSION.SDK_INT>=29){
+            eglContext=EGL14.eglCreateContext(display,configs[0],EGL14.EGL_NO_CONTEXT,
+                    new int[]{EGL14.EGL_CONTEXT_CLIENT_VERSION,3,EGL14.EGL_NONE},0);
+        }
+        if(eglContext==EGL14.EGL_NO_CONTEXT)eglContext = EGL14.eglCreateContext(display, configs[0], EGL14.EGL_NO_CONTEXT,
+                new int[]{EGL14.EGL_CONTEXT_CLIENT_VERSION,2,EGL14.EGL_NONE}, 0);
+        window = EGL14.eglCreateWindowSurface(display, configs[0], target, new int[]{EGL14.EGL_NONE}, 0);
+        if (window == EGL14.EGL_NO_SURFACE || eglContext == EGL14.EGL_NO_CONTEXT
+                || !EGL14.eglMakeCurrent(display, window, window, eglContext))
+            throw new IllegalStateException("HDR EGL window error " + EGL14.eglGetError());
+        EGL14.eglSwapInterval(display, 1);
+        int[] size = new int[1];
+        EGL14.eglQuerySurface(display, window, EGL14.EGL_WIDTH, size, 0); renderWidth = size[0];
+        EGL14.eglQuerySurface(display, window, EGL14.EGL_HEIGHT, size, 0); renderHeight = size[0];
+        String extensions=GLES20.glGetString(GLES20.GL_EXTENSIONS);
+        String versionString=GLES20.glGetString(GLES20.GL_VERSION);
+        rawYuv=HdrDisplayPolicy.rawYuv(Build.VERSION.SDK_INT,versionString,extensions);
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (InputStream source = context.getResources().openRawResource(R.raw.hdr_tonemap)) {
+            byte[] buffer = new byte[4096]; int n;
+            while ((n = source.read(buffer)) > 0) bytes.write(buffer, 0, n);
+        }
+        String tone=bytes.toString("UTF-8");
+        try{program=buildProgram(tone,rawYuv);}catch(RuntimeException failure){
+            if(!rawYuv)throw failure;
+            Log.w(TAG,"Raw YUV shader unavailable; use legacy RGB compatibility output",failure);
+            rawYuv=false;program=buildProgram(tone,false);
+        }
+        position = GLES20.glGetAttribLocation(program,"position"); texcoord = GLES20.glGetAttribLocation(program,"texcoord");
+        transform = GLES20.glGetUniformLocation(program,"transform"); GLES20.glUseProgram(program);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvTransfer"), transfer);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvBt709Source"),forceBt709 ? 1f : 0f);
+        GLES20.glUniform1f(GLES20.glGetUniformLocation(program,"ntvPeak"), peak);
+        GLES20.glUniform1i(GLES20.glGetUniformLocation(program,"video"), 0);
+        yuvMatrix=GLES20.glGetUniformLocation(program,"yuvMatrix");yuvOffset=GLES20.glGetUniformLocation(program,"yuvOffset");
+        updateYuvColor(forceBt709?1:configuredStandard,configuredRange);
+        int[] textures = new int[1]; GLES20.glGenTextures(1, textures, 0); textureId = textures[0];
+        GLES20.glBindTexture(GLES11Ext.GL_TEXTURE_EXTERNAL_OES, textureId);
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MIN_FILTER,GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_MAG_FILTER,GLES20.GL_LINEAR);
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_S,GLES20.GL_CLAMP_TO_EDGE);
+        GLES20.glTexParameteri(GLES11Ext.GL_TEXTURE_EXTERNAL_OES,GLES20.GL_TEXTURE_WRAP_T,GLES20.GL_CLAMP_TO_EDGE);
+        texture = new SurfaceTexture(textureId); texture.setDefaultBufferSize(width,height);
+        texture.setOnFrameAvailableListener(this); input = new Surface(texture);
+    }
+
+    private int buildProgram(String tone,boolean yuv){
+        String vertex=yuv?"#version 300 es\nin vec2 position;in vec2 texcoord;uniform mat4 transform;out vec2 uv;void main(){gl_Position=vec4(position,0.,1.);uv=(transform*vec4(texcoord,0.,1.)).xy;}":
+                "attribute vec2 position;attribute vec2 texcoord;uniform mat4 transform;varying vec2 uv;void main(){gl_Position=vec4(position,0.,1.);uv=(transform*vec4(texcoord,0.,1.)).xy;}";
+        String fragment=yuv?"#version 300 es\n#extension GL_EXT_YUV_target : require\nprecision highp float;uniform highp __samplerExternal2DY2YEXT video;uniform mat3 yuvMatrix;uniform vec3 yuvOffset;in vec2 uv;out vec4 pixel;\n"+tone+"\nvoid main(){pixel=vec4(ntvToSdr(yuvMatrix*(texture(video,uv).xyz-yuvOffset)),1.);}":
+                "#extension GL_OES_EGL_image_external : require\nprecision highp float;uniform samplerExternalOES video;varying vec2 uv;\n"+tone+"\nvoid main(){gl_FragColor=vec4(ntvToSdr(texture2D(video,uv).rgb),1.);}";
+        int vs=0,fs=0,id=0;
+        try{
+            vs=shader(GLES20.GL_VERTEX_SHADER,vertex);fs=shader(GLES20.GL_FRAGMENT_SHADER,fragment);
+            id=GLES20.glCreateProgram();GLES20.glAttachShader(id,vs);GLES20.glAttachShader(id,fs);GLES20.glLinkProgram(id);
+            int[] linked=new int[1];GLES20.glGetProgramiv(id,GLES20.GL_LINK_STATUS,linked,0);
+            if(linked[0]==0)throw new IllegalStateException(GLES20.glGetProgramInfoLog(id));return id;
+        }catch(RuntimeException error){if(id!=0)GLES20.glDeleteProgram(id);throw error;}
+        finally{if(vs!=0)GLES20.glDeleteShader(vs);if(fs!=0)GLES20.glDeleteShader(fs);}
+    }
+    private void updateYuvColor(int standard,int range){
+        if(!rawYuv)return;
+        float[] color=HdrDisplayPolicy.yuvColor(standard,range,sourceDepth);
+        GLES20.glUniformMatrix3fv(yuvMatrix,1,false,color,0);GLES20.glUniform3fv(yuvOffset,1,color,9);
+    }
+
+    private static int shader(int kind, String text) {
+        int id = GLES20.glCreateShader(kind); GLES20.glShaderSource(id,text); GLES20.glCompileShader(id);
+        int[] valid = new int[1]; GLES20.glGetShaderiv(id,GLES20.GL_COMPILE_STATUS,valid,0);
+        if (valid[0] == 0) {
+            String error = GLES20.glGetShaderInfoLog(id); GLES20.glDeleteShader(id);
+            throw new IllegalStateException(error);
+        }
+        return id;
+    }
+
+    @Override public void onFrameAvailable(SurfaceTexture value) {
+        if (closed) return;
+        // Created on this HandlerThread; SurfaceTexture delivers callbacks on its Looper.
+        try {
+            texture.updateTexImage();
+            long timestamp=texture.getTimestamp();
+            if (timestamp == lastTextureTimestamp && renderedFrames > 0) return;
+            lastTextureTimestamp=timestamp; texture.getTransformMatrix(matrix);
+            EGL14.eglQuerySurface(display,window,EGL14.EGL_WIDTH,windowSize,0); renderWidth=windowSize[0];
+            EGL14.eglQuerySurface(display,window,EGL14.EGL_HEIGHT,windowSize,0); renderHeight=windowSize[0];
+            GLES20.glViewport(0,0,renderWidth,renderHeight); GLES20.glUseProgram(program);
+            GLES20.glUniformMatrix4fv(transform,1,false,matrix,0);
+            vertices.position(0); GLES20.glVertexAttribPointer(position,2,GLES20.GL_FLOAT,false,16,vertices);
+            vertices.position(2); GLES20.glVertexAttribPointer(texcoord,2,GLES20.GL_FLOAT,false,16,vertices);
+            GLES20.glEnableVertexAttribArray(position); GLES20.glEnableVertexAttribArray(texcoord);
+            GLES20.glDrawArrays(GLES20.GL_TRIANGLE_STRIP,0,4);
+            if (!EGL14.eglSwapBuffers(display,window)) throw new IllegalStateException("HDR swap failed");
+            long now=SystemClock.elapsedRealtime();
+            renderedFrames++; lastRenderedAt=now;
+            if (rateStart == 0) {rateStart=now;rateFrames=renderedFrames;}
+            if (now-rateStart >= 500) {
+                renderedRate=(renderedFrames-rateFrames)*1000f/(now-rateStart);
+                rateStart=now;rateFrames=renderedFrames;
+            }
+        } catch (RuntimeException error) {
+            failure = error; Log.e(TAG,"HDR output failed",error); release();
+        }
+    }
+
+    public void release() {
+        if (closed) return; closed = true;
+        Runnable close = () -> {
+            try { destroyGl(); }
+            finally { stopped.countDown(); thread.quit(); if (active==this) active=null; }
+        };
+        if (Looper.myLooper()==thread.getLooper()) close.run();
+        else handler.post(close);
+    }
+
+    private void destroyGl() {
+        if (texture != null) texture.setOnFrameAvailableListener(null);
+        if (input != null) { input.release(); input = null; }
+        if (texture != null) { texture.release(); texture = null; }
+        if (display != EGL14.EGL_NO_DISPLAY) {
+            if (program != 0) GLES20.glDeleteProgram(program);
+            if (textureId != 0) GLES20.glDeleteTextures(1,new int[]{textureId},0);
+            EGL14.eglMakeCurrent(display,EGL14.EGL_NO_SURFACE,EGL14.EGL_NO_SURFACE,EGL14.EGL_NO_CONTEXT);
+            if (window != EGL14.EGL_NO_SURFACE) EGL14.eglDestroySurface(display,window);
+            if (eglContext != EGL14.EGL_NO_CONTEXT) EGL14.eglDestroyContext(display,eglContext);
+            EGL14.eglTerminate(display); EGL14.eglReleaseThread();
+        }
+        display = EGL14.EGL_NO_DISPLAY; window = EGL14.EGL_NO_SURFACE; eglContext = EGL14.EGL_NO_CONTEXT;
+        program = textureId = 0;
+    }
+
+}

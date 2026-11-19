@@ -1,0 +1,344 @@
+package xiao.bu.tv;
+
+import java.util.Locale;
+
+final class Channel {
+    final String number;
+    final String name;
+    final String streamId;
+    final String url;
+    final String[] urls;
+    final String yangshipinPid;
+    final String yangshipinStreamId;
+    final String yangshipinMaxDefinition;
+    final String epgId;
+    final String logoUrl;
+    final boolean radio;
+    final java.util.Map<String,IptvCatchup> catchupSources;
+    private volatile IptvCatchup[] resolvedCatchups;
+    final String[] subtitleUrls;
+    final int catalogSource;
+    final String favoriteKey;
+
+    Channel(String number, String name, String streamId, String url,
+            String yangshipinPid, String yangshipinStreamId) {
+        this(number, name, streamId, url, yangshipinPid, yangshipinStreamId, null);
+    }
+
+    Channel(String number, String name, String streamId, String url,
+            String yangshipinPid, String yangshipinStreamId,
+            String yangshipinMaxDefinition) {
+        this(number, name, streamId, url, yangshipinPid, yangshipinStreamId,
+                yangshipinMaxDefinition, null);
+    }
+
+    Channel(String number, String name, String streamId, String url,
+            String yangshipinPid, String yangshipinStreamId,
+            String yangshipinMaxDefinition, String epgId) {
+        this(number, name, streamId,
+                url == null ? new String[0] : new String[] { url },
+                yangshipinPid, yangshipinStreamId, yangshipinMaxDefinition, epgId);
+    }
+
+    Channel(String number, String name, String streamId, String[] urls,
+            String yangshipinPid, String yangshipinStreamId,
+            String yangshipinMaxDefinition, String epgId) {
+        this(number, name, streamId, urls, yangshipinPid, yangshipinStreamId,
+                yangshipinMaxDefinition, epgId, -1, null);
+    }
+
+    private Channel(String number, String name, String streamId, String[] urls,
+            String yangshipinPid, String yangshipinStreamId,
+            String yangshipinMaxDefinition, String epgId, int catalogSource,
+            String favoriteKey) {
+        this(number, name, streamId, urls, yangshipinPid, yangshipinStreamId,
+                yangshipinMaxDefinition, epgId, catalogSource, favoriteKey, "");
+    }
+
+    private Channel(String number, String name, String streamId, String[] urls,
+            String yangshipinPid, String yangshipinStreamId,
+            String yangshipinMaxDefinition, String epgId, int catalogSource,
+            String favoriteKey, String logoUrl) {
+        this(number, name, streamId, urls, yangshipinPid, yangshipinStreamId,
+                yangshipinMaxDefinition, epgId, catalogSource, favoriteKey, logoUrl, new String[0]);
+    }
+
+    private Channel(String number, String name, String streamId, String[] urls,
+            String yangshipinPid, String yangshipinStreamId, String yangshipinMaxDefinition,
+            String epgId, int catalogSource, String favoriteKey, String logoUrl, String[] subtitleUrls) {
+        this(number, name, streamId, urls, yangshipinPid, yangshipinStreamId,
+                yangshipinMaxDefinition, epgId, catalogSource, favoriteKey, logoUrl, subtitleUrls, false);
+    }
+
+    private Channel(String number, String name, String streamId, String[] urls,
+            String yangshipinPid, String yangshipinStreamId, String yangshipinMaxDefinition,
+            String epgId, int catalogSource, String favoriteKey, String logoUrl, String[] subtitleUrls,
+            boolean radio) {
+        this(number,name,streamId,urls,yangshipinPid,yangshipinStreamId,yangshipinMaxDefinition,
+                epgId,catalogSource,favoriteKey,logoUrl,subtitleUrls,radio,java.util.Collections.<String,IptvCatchup>emptyMap());
+    }
+
+    private Channel(String number,String name,String streamId,String[] urls,String yangshipinPid,
+            String yangshipinStreamId,String yangshipinMaxDefinition,String epgId,int catalogSource,
+            String favoriteKey,String logoUrl,String[] subtitleUrls,boolean radio,
+            java.util.Map<String,IptvCatchup> catchupSources) {
+        this.catchupSources=catchupSources;
+        this.number = number;
+        this.name = name;
+        this.streamId = streamId;
+        this.urls = uniqueSourceUrls(urls);
+        this.url = this.urls.length == 0 ? null : this.urls[0];
+        this.yangshipinPid = yangshipinPid;
+        this.yangshipinStreamId = yangshipinStreamId;
+        this.yangshipinMaxDefinition = yangshipinMaxDefinition;
+        this.epgId = epgId;
+        this.logoUrl = logoUrl == null ? "" : logoUrl.trim();
+        this.radio = radio;
+        this.subtitleUrls = subtitleUrls.clone();
+        this.catalogSource = catalogSource;
+        this.favoriteKey = favoriteKey;
+    }
+
+    Channel withAdditionalUrl(String additionalUrl) {
+        if (additionalUrl == null || additionalUrl.trim().length() == 0) {
+            return this;
+        }
+        String candidate = additionalUrl.trim();
+        for (String existing : urls) {
+            if (sameSourceUrl(existing, candidate)) {
+                return this;
+            }
+        }
+        String[] combined = new String[urls.length + 1];
+        System.arraycopy(urls, 0, combined, 0, urls.length);
+        combined[urls.length] = candidate;
+        return new Channel(number, name, streamId, combined,
+                yangshipinPid, yangshipinStreamId, yangshipinMaxDefinition, epgId,
+                catalogSource, favoriteKey, logoUrl, subtitleUrls, radio, catchupSources);
+    }
+
+    static boolean sameSourceUrl(String first, String second) {
+        return canonicalSourceUrl(first).equals(canonicalSourceUrl(second));
+    }
+
+    static String canonicalSourceUrl(String sourceUrl) {
+        if (sourceUrl == null) {
+            return "";
+        }
+        String value = sourceUrl.trim();
+        String lower = value.toLowerCase(Locale.US);
+        if (lower.startsWith("webview://")) {
+            value = value.substring("webview://".length());
+            lower = value.toLowerCase(Locale.US);
+        }
+        int fragment = value.indexOf('#');
+        if (fragment >= 0) {
+            value = value.substring(0, fragment);
+            lower = value.toLowerCase(Locale.US);
+        }
+        if (lower.indexOf("yangshipin.cn") >= 0) {
+            String pid = queryValue(lower, "pid");
+            if (pid.length() > 0) {
+                return "yangshipin:pid=" + pid;
+            }
+        }
+        String cctvStream = cctvStreamKey(lower);
+        if (cctvStream.length() > 0) {
+            return "cctv:stream=" + cctvStream;
+        }
+        value = value.replace("://www.yangshipin.cn", "://yangshipin.cn")
+                .replace("://www.tv.cctv.com", "://tv.cctv.com");
+        value = value.replace("/?", "?");
+        while (value.endsWith("/")) {
+            value = value.substring(0, value.length() - 1);
+        }
+        return value.toLowerCase(Locale.US);
+    }
+
+    /**
+     * CCTV's live page and its CDN playlist are two entrances to the same stream.
+     * Treat them as one source while keeping Yangshipin as an independent fallback.
+     */
+    private static String cctvStreamKey(String lowerUrl) {
+        String pageMarker = "tv.cctv.com/live/";
+        int pageStart = lowerUrl.indexOf(pageMarker);
+        if (pageStart >= 0) {
+            return pathToken(lowerUrl, pageStart + pageMarker.length());
+        }
+        String playlistMarker = "/cdrmld";
+        int playlistStart = lowerUrl.indexOf(playlistMarker);
+        if (playlistStart >= 0) {
+            int start = playlistStart + playlistMarker.length();
+            int end = lowerUrl.indexOf('_', start);
+            if (end > start && lowerUrl.indexOf("/index.m3u8", end) >= 0) {
+                return lowerUrl.substring(start, end);
+            }
+        }
+        return "";
+    }
+
+    private static String pathToken(String value, int start) {
+        int end = start;
+        while (end < value.length()) {
+            char current = value.charAt(end);
+            if (current == '/' || current == '?' || current == '#' || current == '&') {
+                break;
+            }
+            end++;
+        }
+        return end > start ? value.substring(start, end) : "";
+    }
+
+    private static String[] uniqueSourceUrls(String[] sourceUrls) {
+        if (sourceUrls == null || sourceUrls.length == 0) {
+            return new String[0];
+        }
+        String[] unique = new String[sourceUrls.length];
+        int count = 0;
+        for (String sourceUrl : sourceUrls) {
+            if (sourceUrl == null || sourceUrl.trim().length() == 0) {
+                continue;
+            }
+            String candidate = sourceUrl.trim();
+            boolean duplicate = false;
+            for (int index = 0; index < count; index++) {
+                if (sameSourceUrl(unique[index], candidate)) {
+                    duplicate = true;
+                    break;
+                }
+            }
+            if (!duplicate) {
+                unique[count++] = candidate;
+            }
+        }
+        if (count == unique.length) {
+            return unique;
+        }
+        String[] result = new String[count];
+        System.arraycopy(unique, 0, result, 0, count);
+        return result;
+    }
+
+    private static String queryValue(String lowerUrl, String key) {
+        String marker = key.toLowerCase(Locale.US) + "=";
+        int start = lowerUrl.indexOf(marker);
+        while (start >= 0) {
+            if (start == 0 || lowerUrl.charAt(start - 1) == '?'
+                    || lowerUrl.charAt(start - 1) == '&') {
+                start += marker.length();
+                int end = start;
+                while (end < lowerUrl.length()) {
+                    char value = lowerUrl.charAt(end);
+                    if (value == '&' || value == '#') {
+                        break;
+                    }
+                    end++;
+                }
+                return lowerUrl.substring(start, end);
+            }
+            start = lowerUrl.indexOf(marker, start + marker.length());
+        }
+        return "";
+    }
+
+    Channel asFavorite(String key, int source) {
+        return new Channel(number, name, streamId, urls,
+                yangshipinPid, yangshipinStreamId, yangshipinMaxDefinition, epgId,
+                source, key, logoUrl, subtitleUrls, radio, catchupSources);
+    }
+
+    Channel withCatalogSource(int source) {
+        return new Channel(number, name, streamId, urls,
+                yangshipinPid, yangshipinStreamId, yangshipinMaxDefinition, epgId,
+                source, favoriteKey, logoUrl, subtitleUrls, radio, catchupSources);
+    }
+
+    Channel withLogo(String url) {
+        return new Channel(number, name, streamId, urls, yangshipinPid,
+                yangshipinStreamId, yangshipinMaxDefinition, epgId,
+                catalogSource, favoriteKey, url, subtitleUrls, radio, catchupSources);
+    }
+
+    Channel withRadio(boolean value) {
+        if (radio == value) return this;
+        return new Channel(number, name, streamId, urls, yangshipinPid,
+                yangshipinStreamId, yangshipinMaxDefinition, epgId,
+                catalogSource, favoriteKey, logoUrl, subtitleUrls, value, catchupSources);
+    }
+
+    Channel withSubtitles(String values) {
+        java.util.LinkedHashSet<String> result = new java.util.LinkedHashSet<String>();
+        java.util.Collections.addAll(result, subtitleUrls);
+        if (values != null) for (String value : values.split("\\n")) {
+            String url = resolveSubtitleUrl(value, "");
+            if (!url.isEmpty() && result.size() < 16) result.add(url);
+        }
+        return new Channel(number, name, streamId, urls, yangshipinPid,
+                yangshipinStreamId, yangshipinMaxDefinition, epgId, catalogSource,
+                favoriteKey, logoUrl, result.toArray(new String[result.size()]), radio, catchupSources);
+    }
+
+    String subtitleUrlsText() {
+        StringBuilder result = new StringBuilder();
+        for (String url : subtitleUrls) { if (result.length() > 0) result.append('\n'); result.append(url); }
+        return result.toString();
+    }
+
+    static String resolveSubtitleUrl(String value, String base) {
+        if (value == null) return "";
+        value = value.trim();
+        if (value.length() > 1 && ((value.startsWith("\"") && value.endsWith("\""))
+                || (value.startsWith("'") && value.endsWith("'")))) value = value.substring(1, value.length()-1);
+        if (value.isEmpty() || value.indexOf('\n') >= 0 || value.indexOf('\r') >= 0) return "";
+        try {
+            java.net.URL url = base == null || base.isEmpty() ? new java.net.URL(value)
+                    : new java.net.URL(new java.net.URL(base), value);
+            return "http".equalsIgnoreCase(url.getProtocol()) || "https".equalsIgnoreCase(url.getProtocol())
+                    ? url.toString().replace(" ", "%20") : "";
+        } catch (Exception ignored) { return ""; }
+    }
+
+    Channel withCatchup(String url,IptvCatchup spec) {
+        if(spec==null||!spec.configured())return this;
+        java.util.Map<String,IptvCatchup> entries=new java.util.LinkedHashMap<>(catchupSources);
+        entries.put(canonicalSourceUrl(url),spec);return copyCatchups(entries);
+    }
+    Channel withCatchups(String stored) {
+        if(stored==null||stored.isEmpty())return this;
+        java.util.Map<String,IptvCatchup> entries=new java.util.LinkedHashMap<>(catchupSources);
+        for(java.util.Map.Entry<String,IptvCatchup> e:IptvCatchup.decode(stored).entrySet())if(!entries.containsKey(e.getKey()))entries.put(e.getKey(),e.getValue());
+        return entries.isEmpty()?this:copyCatchups(entries);
+    }
+    private Channel copyCatchups(java.util.Map<String,IptvCatchup> entries) {
+        return new Channel(number,name,streamId,urls,yangshipinPid,yangshipinStreamId,
+                yangshipinMaxDefinition,epgId,catalogSource,favoriteKey,logoUrl,subtitleUrls,radio,
+                java.util.Collections.unmodifiableMap(entries));
+    }
+    String catchupText(){return IptvCatchup.encode(catchupSources);}
+    // Derived lazily when the guide is opened; inferred rules do not grow SQLite or delay startup.
+    private IptvCatchup[] catchupSpecs(){
+        IptvCatchup[] result=resolvedCatchups;if(result!=null)return result;
+        result=new IptvCatchup[urls.length];
+        for(int i=0;i<urls.length;i++){
+            IptvCatchup spec=catchupSources.get(canonicalSourceUrl(urls[i]));
+            result[i]=spec!=null&&spec.enabled()?spec:radio?null:IptvCatchup.automatic(urls[i],spec);
+        }
+        resolvedCatchups=result;return result;
+    }
+    IptvCatchup catchupFor(int source){IptvCatchup[] specs=catchupSpecs();return specs.length==0?null:specs[(source%specs.length+specs.length)%specs.length];}
+    double catchupDays(){double days=0;for(IptvCatchup c:catchupSpecs())if(c!=null)days=Math.max(days,c.days);return days;}
+    boolean canCatchup(long start,long end,long now){for(IptvCatchup c:catchupSpecs())if(c!=null&&c.available(start,end,now))return true;return false;}
+    boolean automaticCatchupOnly(){boolean any=false;for(IptvCatchup c:catchupSpecs())if(c!=null){if(!c.inferred())return false;any=true;}return any;}
+
+    int sourceCount() {
+        return urls.length;
+    }
+
+    String sourceUrl(int index) {
+        if (urls.length == 0) {
+            return null;
+        }
+        int wrapped = (index % urls.length + urls.length) % urls.length;
+        return urls[wrapped];
+    }
+}

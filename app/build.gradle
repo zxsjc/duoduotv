@@ -1,0 +1,273 @@
+apply plugin: 'com.android.application'
+
+import groovy.json.JsonOutput
+import java.security.MessageDigest
+
+def releaseSigningDirectory = rootProject.file('.signing')
+def releaseKeystore = new File(releaseSigningDirectory, 'iptv-release.jks')
+def releaseSigningInfo = new File(releaseSigningDirectory, 'keystore-info.properties')
+def releaseSigningAvailable = releaseKeystore.isFile() && releaseSigningInfo.isFile()
+if (releaseKeystore.exists() != releaseSigningInfo.exists()) {
+    throw new GradleException('Both .signing/iptv-release.jks and '
+            + '.signing/keystore-info.properties are required for release signing.')
+}
+def releaseSigningProperties = new Properties()
+def configuredTargetSdk = 25
+def configuredVersionCode = project.hasProperty('versionCodeOverride')
+        ? Integer.parseInt(project.property('versionCodeOverride').toString()) : 8
+if (releaseSigningAvailable) {
+    releaseSigningInfo.withInputStream { releaseSigningProperties.load(it) }
+    ['alias', 'storePassword', 'keyPassword'].each { propertyName ->
+        if (!releaseSigningProperties.getProperty(propertyName)) {
+            throw new GradleException("Missing ${propertyName} in "
+                    + '.signing/keystore-info.properties')
+        }
+    }
+}
+
+android {
+    namespace 'xiao.bu.tv'
+    buildFeatures { buildConfig true }
+    // The prebuilt native libraries are already stripped; preserve the audited binaries.
+    packagingOptions { jniLibs { keepDebugSymbols += ['**/*.so'] } }
+    if (project.hasProperty('cjsV5Assets')) {
+        sourceSets.androidTest.assets.srcDir project.property('cjsV5Assets')
+    }
+    compileSdkVersion 34
+    buildToolsVersion '35.0.0'
+    testBuildType project.findProperty('testBuildType') ?: 'debug'
+
+    signingConfigs {
+        if (releaseSigningAvailable) {
+            iptvRelease {
+                storeFile releaseKeystore
+                storePassword releaseSigningProperties.getProperty('storePassword')
+                keyAlias releaseSigningProperties.getProperty('alias')
+                keyPassword releaseSigningProperties.getProperty('keyPassword')
+            }
+        }
+    }
+
+    defaultConfig {
+        applicationId project.hasProperty('applicationIdOverride')
+                ? project.property('applicationIdOverride').toString() : 'xiao.duoduo.tv'
+        minSdkVersion 14
+        // One 320x180 fallback for API 14-20; API 21+ keeps the original vector.
+        vectorDrawables.generatedDensities = ['xhdpi']
+        // API 25 keeps the legacy package-installer flow without declaring
+        // REQUEST_INSTALL_PACKAGES, while remaining installable on Android 15.
+        targetSdkVersion configuredTargetSdk
+        versionCode configuredVersionCode
+        versionName '1.8.0'
+        buildConfigField 'boolean', 'CAST_LATENCY_TRACE',
+                project.findProperty('castLatencyTrace') == 'true' ? 'true' : 'false'
+        testInstrumentationRunner project.hasProperty('testRunner')
+                ? project.property('testRunner').toString() : 'xiao.bu.tv.DolbyPlaybackInstrumentation'
+    }
+
+    flavorDimensions 'architecture'
+    productFlavors {
+        arm32 {
+            dimension 'architecture'
+            minSdkVersion 14
+            ndk { abiFilters 'armeabi-v7a' }
+            buildConfigField 'String', 'CJS_PLUGIN_ABI', '"armeabi-v7a"'
+            buildConfigField 'String', 'UPDATE_APK_URL_FIELD', '"apk32Url"'
+            buildConfigField 'String', 'UPDATE_SHA256_FIELD', '"sha25632"'
+            buildConfigField 'String', 'UPDATE_APK_ASSET', '"nTv.apk"'
+        }
+        arm64 {
+            dimension 'architecture'
+            // Android supports 64-bit native processes from API 21 onward.
+            minSdkVersion 21
+            ndk { abiFilters 'arm64-v8a' }
+            buildConfigField 'String', 'CJS_PLUGIN_ABI', '"arm64-v8a"'
+            buildConfigField 'String', 'UPDATE_APK_URL_FIELD', '"apk64Url"'
+            buildConfigField 'String', 'UPDATE_SHA256_FIELD', '"sha25664"'
+            buildConfigField 'String', 'UPDATE_APK_ASSET', '"nTv64.apk"'
+        }
+        x86 {
+            dimension 'architecture'
+            minSdkVersion 14
+            ndk { abiFilters 'x86' }
+            buildConfigField 'String', 'CJS_PLUGIN_ABI', '"x86"'
+            buildConfigField 'String', 'UPDATE_APK_URL_FIELD', '"apkX86Url"'
+            buildConfigField 'String', 'UPDATE_SHA256_FIELD', '"sha256X86"'
+            buildConfigField 'String', 'UPDATE_APK_ASSET', '"nTvX86.apk"'
+        }
+    }
+
+    buildTypes {
+        debug {
+            if (releaseSigningAvailable) {
+                signingConfig signingConfigs.iptvRelease
+            }
+            buildConfigField 'boolean', 'EMBED_CONTROL_PAGES', 'true'
+            buildConfigField 'String', 'RECOMMENDED_JOY_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/webSourceM3U8/refs/heads/main/JoyPage.txt"'
+            buildConfigField 'String', 'RECOMMENDED_FM_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/webSourceM3U8/refs/heads/main/fm.txt"'
+            buildConfigField 'String', 'RECOMMENDED_TEST_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/webSourceM3U8/refs/heads/main/test.txt"'
+            buildConfigField 'String', 'RECOMMENDED_WEBVIEW_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/webSourceM3U8/refs/heads/main/webview.txt"'
+            buildConfigField 'String', 'FLY_MOUSE_PAGE_SOURCE_URL', '""'
+            buildConfigField 'String', 'VIDEO_RECORDER_PAGE_SOURCE_URL', '""'
+            buildConfigField 'String', 'MP4_FINALIZER_SOURCE_URL', '""'
+        }
+        release {
+            // R8 removes unused code, optimizes bytecode and shortens internal names.
+            // JNI, JavaScript and downloaded plugin entry points stay in the keep rules.
+            minifyEnabled true
+            shrinkResources true
+            if (releaseSigningAvailable) {
+                signingConfig signingConfigs.iptvRelease
+            }
+            buildConfigField 'boolean', 'EMBED_CONTROL_PAGES', 'false'
+            buildConfigField 'String', 'RECOMMENDED_JOY_SOURCE_URL',
+                    '"https://github.com/buhanzhe/webSourceM3U8/releases/latest/download/JoyPage.txt"'
+            buildConfigField 'String', 'RECOMMENDED_FM_SOURCE_URL',
+                    '"https://github.com/buhanzhe/webSourceM3U8/releases/latest/download/fm.txt"'
+            buildConfigField 'String', 'RECOMMENDED_TEST_SOURCE_URL',
+                    '"https://github.com/buhanzhe/webSourceM3U8/releases/latest/download/test.txt"'
+            buildConfigField 'String', 'RECOMMENDED_WEBVIEW_SOURCE_URL',
+                    '"https://github.com/buhanzhe/webSourceM3U8/releases/latest/download/webview.txt"'
+            buildConfigField 'String', 'FLY_MOUSE_PAGE_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/NativeWasmTv/gh-pages/flymouse.html"'
+            buildConfigField 'String', 'VIDEO_RECORDER_PAGE_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/NativeWasmTv/gh-pages/video-recorder.html"'
+            buildConfigField 'String', 'MP4_FINALIZER_SOURCE_URL',
+                    '"https://raw.githubusercontent.com/buhanzhe/NativeWasmTv/gh-pages/mp4-finalizer.js"'
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            testProguardFile 'proguard-test-rules.pro'
+            if (project.findProperty('testRunner') == 'xiao.bu.tv.CjsV5Instrumentation') {
+                proguardFile 'proguard-cjs-test.pro'
+            }
+        }
+    }
+
+    sourceSets {
+        main {
+            jni.srcDirs = []
+            jniLibs.srcDirs = ['src/main/libs']
+        }
+        debug {
+            // Debug builds serve the Pages files directly from the TV. Release builds
+            // fetch the same files through GithubProxy and therefore do not package them.
+            assets.srcDirs = [rootProject.file('docs')]
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    aaptOptions {
+        // Keep AAPT's defaults. Debug pages need HTML/JS, not authoring reports
+        // or the device-matrix CSV/screenshots; release pages stay remote.
+        ignoreAssetsPattern '!.svn:!.git:!.ds_store:!*.scc:.*:<dir>_*:!CVS:!thumbs.db:!picasa.ini:!*~:!*.md:!ku9-device-matrix-*'
+    }
+}
+
+// WebKit 1.9.0 only references Core's Pair (in WebViewAssetLoader.Builder).
+// Keep that exact upstream class and its equality helper without Core's resources, component
+// factory and consumer rules that retain parcelizers/lifecycle classes. Re-audit
+// WebKit's class dependencies before upgrading this pinned version.
+configurations {
+    webkitCorePair { transitive = false }
+}
+
+task packageWebkitCorePair(type: Jar) {
+    def retainedClasses = ['androidx/core/util/Pair.class',
+            'androidx/core/util/ObjectsCompat.class']
+    inputs.property 'retainedClasses', retainedClasses
+    inputs.files configurations.webkitCorePair
+    archiveFileName.set('webkit-core-pair.jar')
+    destinationDirectory.set(file("$buildDir/generated/webkit"))
+    from({
+        File classes = zipTree(configurations.webkitCorePair.singleFile)
+                .matching { include 'classes.jar' }.singleFile
+        zipTree(classes)
+    }) {
+        include retainedClasses
+    }
+}
+
+dependencies {
+    implementation 'tv.danmaku.ijk.media:ijkplayer-java:0.8.8'
+    // All ABIs use the patched local libraries, including Dolby audio and metrics.
+    implementation('androidx.webkit:webkit:1.9.0') {
+        exclude group: 'androidx.core', module: 'core'
+    }
+    webkitCorePair 'androidx.core:core:1.1.0@aar'
+    implementation files(packageWebkitCorePair)
+    // 4.x already includes Native crash reporting; do not add a second NDK SDK.
+    implementation 'com.tencent.bugly:crashreport:4.1.9.3'
+    // 3.12.x is the final OkHttp branch that supports Android 4.4 and Java 7.
+    implementation 'com.squareup.okhttp3:okhttp:3.12.13'
+    implementation 'com.squareup.okhttp3:okhttp-urlconnection:3.12.13'
+}
+
+task generateVersionFile {
+    group = 'distribution'
+    description = 'Generate the lightweight update manifest; important manifests are opt-in.'
+
+    doLast {
+        Closure<String> fileSha256 = { String propertyName ->
+            if (!project.hasProperty(propertyName)) {
+                return ''
+            }
+            File apkFile = rootProject.file(project.property(propertyName))
+            if (!apkFile.isFile()) {
+                throw new GradleException("Update APK does not exist: ${apkFile}")
+            }
+            MessageDigest digest = MessageDigest.getInstance('SHA-256')
+            apkFile.withInputStream { input ->
+                byte[] buffer = new byte[64 * 1024]
+                int count
+                while ((count = input.read(buffer)) != -1) {
+                    digest.update(buffer, 0, count)
+                }
+            }
+            return digest.digest().collect { String.format('%02x', it & 0xff) }.join()
+        }
+        String sha25632 = fileSha256('updateApk32')
+        String sha25664 = fileSha256('updateApk64')
+        String sha256X86 = fileSha256('updateApkX86')
+        if (!sha25632 || !sha25664 || !sha256X86) {
+            throw new GradleException('-PupdateApk32, -PupdateApk64 and -PupdateApkX86 are required')
+        }
+        String releaseBase = 'https://github.com/buhanzhe/NativeWasmTv/releases/latest/download/'
+        // Keep the release asset names compatible with already shipped updaters.
+        String apk32Asset = 'nTv.apk'
+        String apk64Asset = 'nTv64.apk'
+        String apkX86Asset = 'nTvX86.apk'
+
+        def manifest = [
+                versionCode : android.defaultConfig.versionCode,
+                versionName : android.defaultConfig.versionName,
+                // apkUrl/sha256 keep every released 32-bit updater backward compatible.
+                apkUrl      : releaseBase + apk32Asset,
+                apk32Url    : releaseBase + apk32Asset,
+                apk64Url    : releaseBase + apk64Asset,
+                apkX86Url   : releaseBase + apkX86Asset,
+                sha256      : sha25632,
+                sha25632    : sha25632,
+                sha25664    : sha25664,
+                sha256X86   : sha256X86,
+                releaseNotes: project.findProperty('releaseNotes') ?: '修复问题并提升播放体验。'
+        ]
+        String manifestJson = JsonOutput.prettyPrint(JsonOutput.toJson(manifest)) + '\n'
+        File liteOutput = rootProject.file('version-lite.json')
+        liteOutput.setText(manifestJson, 'UTF-8')
+        boolean importantUpdate = project.findProperty('importantUpdate') == 'true'
+        if (importantUpdate) {
+            rootProject.file('version.json').setText(manifestJson, 'UTF-8')
+            rootProject.file('version-iptv.json').setText(manifestJson, 'UTF-8')
+        }
+        logger.lifecycle("Generated ${liteOutput} (arm32=${sha25632 ?: 'unset'}, "
+                + "arm64=${sha25664 ?: 'unset'}, x86=${sha256X86 ?: 'unset'}, "
+                + "important=${importantUpdate})")
+    }
+}
