@@ -58,7 +58,8 @@ android {
         // REQUEST_INSTALL_PACKAGES, while remaining installable on Android 15.
         targetSdkVersion configuredTargetSdk
         versionCode configuredVersionCode
-        versionName '1.8.0'
+        versionName project.hasProperty('versionNameOverride')
+                ? project.property('versionNameOverride').toString() : '2.0.0'
         buildConfigField 'boolean', 'CAST_LATENCY_TRACE',
                 project.findProperty('castLatencyTrace') == 'true' ? 'true' : 'false'
         testInstrumentationRunner project.hasProperty('testRunner')
@@ -238,7 +239,7 @@ task generateVersionFile {
         if (!sha25632 || !sha25664 || !sha256X86) {
             throw new GradleException('-PupdateApk32, -PupdateApk64 and -PupdateApkX86 are required')
         }
-        String releaseBase = 'https://github.com/buhanzhe/NativeWasmTv/releases/latest/download/'
+        String releaseBase = 'https://github.com/zxsjc/duoduotv/releases/latest/download/'
         // Keep the release asset names compatible with already shipped updaters.
         String apk32Asset = 'nTv.apk'
         String apk64Asset = 'nTv64.apk'

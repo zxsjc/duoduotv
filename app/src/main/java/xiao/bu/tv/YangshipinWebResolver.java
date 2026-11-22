@@ -812,6 +812,7 @@ final class YangshipinWebResolver {
                     return;
                 }
                 Log.w(TAG, "Yangshipin resolve failed for " + pending.channel.name + ": " + reason);
+                YangshipinChannelDirectory.refreshAfterFailure();
                 clearPending(true);
                 pending.callback.onFailed(pending.requestId, reason);
             }

@@ -1,11 +1,13 @@
 {
-    "versionCode": 6,
-    "versionName": "1.6.0",
-    "apkUrl": "https://github.com/buhanzhe/NativeWasmTv/releases/latest/download/nTv.apk",
-    "apk32Url": "https://github.com/buhanzhe/NativeWasmTv/releases/latest/download/nTv.apk",
-    "apk64Url": "https://github.com/buhanzhe/NativeWasmTv/releases/latest/download/nTv64.apk",
-    "sha256": "39516eb223e433b578b0c785897ebcecfc2c2d20dd6396a3fb88a6dbff4cb934",
-    "sha25632": "39516eb223e433b578b0c785897ebcecfc2c2d20dd6396a3fb88a6dbff4cb934",
-    "sha25664": "6a818a454c2b06151fa56c180a861ac2221416760604f50a041ba4733bef7163",
+    "versionCode": 12,
+    "versionName": "2.1.0",
+    "apkUrl": "https://github.com/zxsjc/duoduotv/releases/latest/download/nTv.apk",
+    "apk32Url": "https://github.com/zxsjc/duoduotv/releases/latest/download/nTv.apk",
+    "apk64Url": "https://github.com/zxsjc/duoduotv/releases/latest/download/nTv64.apk",
+    "apkX86Url": "https://github.com/zxsjc/duoduotv/releases/latest/download/nTvX86.apk",
+    "sha256": "6a8181dc495d8b28cf38c8e7fc4beb7f6cc23c024cf8e6251e37bea2583e0fbb",
+    "sha25632": "6a8181dc495d8b28cf38c8e7fc4beb7f6cc23c024cf8e6251e37bea2583e0fbb",
+    "sha25664": "52040bf8b8bbc6e9b63ea33fd3bb25c673cce3b48a48b1e1327812458d2d5eca",
+    "sha256X86": "cf3f3434ee451be2d2f6bfe168902aa6aec7c20592192cc731a8fb0a51709f4c",
     "releaseNotes": "\u4fee\u590d\u95ee\u9898\u5e76\u63d0\u5347\u64ad\u653e\u4f53\u9a8c\u3002"
 }

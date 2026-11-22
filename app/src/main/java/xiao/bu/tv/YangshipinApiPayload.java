@@ -84,12 +84,15 @@ final class YangshipinApiPayload {
 
     static String createLiveBody(Channel channel, String guid, String liveRandom,
             long serverSeconds, String definition) throws Exception {
+        // 流 ID 优先用自动更新的最新值，内置值只作兜底
+        String cnlid = YangshipinChannelDirectory.resolve(
+                channel.yangshipinPid, channel.yangshipinStreamId);
         TreeMap<String, String> live = new TreeMap<String, String>();
-        live.put("cnlid", channel.yangshipinStreamId);
+        live.put("cnlid", cnlid);
         live.put("livepid", channel.yangshipinPid);
         live.put("stream", "2");
         live.put("guid", guid);
-        live.put("cKey", createCKey(channel.yangshipinStreamId, guid, serverSeconds));
+        live.put("cKey", createCKey(cnlid, guid, serverSeconds));
         live.put("adjust", "1");
         live.put("sphttps", "1");
         live.put("platform", PLATFORM);

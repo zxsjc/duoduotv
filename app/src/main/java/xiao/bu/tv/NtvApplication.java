@@ -43,6 +43,7 @@ public final class NtvApplication extends Application {
                 public void onActivityDestroyed(android.app.Activity activity) { }
             });
             GithubProxy.initialize(this);
+            YangshipinChannelDirectory.initialize(this);
             CrashReporting.startIfAllowed(this);
             ReceivedApkCleanup.initialize(this);
         }

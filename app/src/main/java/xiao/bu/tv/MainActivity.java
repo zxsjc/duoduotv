@@ -1590,9 +1590,9 @@ public final class MainActivity extends Activity implements TvUiPlugin.Listener,
         root.requestFocus();
         autoUpdater = new AutoUpdater(this);
         autoUpdater.setLiteListener(()->{if(!isFinishing())tvUiMenu.refresh();});
-        // 已按需求关闭自动更新弹窗：不再在启动时自动检查更新（checkForUpdates 会弹更新提示框）。
+        // 启动时自动检查更新并弹窗提示（升级源见 AutoUpdater 的 IMPORTANT_VERSION_URL）。
         // 手动更新仍可用（菜单“检查更新 / 立即更新”以及系统信息页），走 checkLiteForUpdates / installLiteUpdate。
-        // deferStartupMaintenance("update-check", () -> autoUpdater.checkForUpdates());
+        deferStartupMaintenance("update-check", () -> autoUpdater.checkForUpdates());
         deferStartupMaintenance("plugin-update-check", () -> new Thread(() -> {
             try { CjsPluginRuntime.checkInstalledOnce(); }
             catch (Exception error) { Log.w(TAG, "Startup plugin update failed; retaining local plugins", error); }
